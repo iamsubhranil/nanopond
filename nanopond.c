@@ -299,6 +299,7 @@
 #include <SDL/SDL.h>
 #endif /* _MSC_VER */
 #endif /* USE_SDL */
+#include"thpool.h"	// Multithreading support
 
 	/* ----------------------------------------------------------------------- */
 	/* This is the Mersenne Twister by Makoto Matsumoto and Takuji Nishimura   */
