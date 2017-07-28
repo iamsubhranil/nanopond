@@ -893,8 +893,8 @@ void introduceEntropy(void *cellIdCounter){
 	pptr->parentID = 0;
 	pptr->lineage = pptr->ID;
 	pptr->generation = 0;
-	pptr->x = x;
-	pptr->y = y;
+	//pptr->x = x;
+	//pptr->y = y;
 #ifdef INFLOW_RATE_VARIATION
 	pptr->energy += INFLOW_RATE_BASE + (getRandom() % INFLOW_RATE_VARIATION);
 #else
@@ -961,6 +961,8 @@ int main(int argc,char **argv)
 			pond[x][y].lineage = 0;
 			pond[x][y].generation = 0;
 			pond[x][y].energy = 0;
+			pond[x][y].x = x;
+			pond[x][y].y = y;
 			for(i=0;i<POND_DEPTH_SYSWORDS;++i)
 				pond[x][y].genome[i] = ~((uintptr_t)0);
 		}
