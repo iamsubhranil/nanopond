@@ -360,6 +360,7 @@
 
 	static unsigned long mt[N]; /* the array for the state vector  */
 	static int mti=N+1; /* mti==N+1 means mt[N] is not initialized */
+	_Atomic int choosingColor = 0; /* To prevent a cell getColor while the scheme is changing */
 
 	/* initializes mt[N] with a seed */
 static void init_genrand(unsigned long s)
@@ -461,6 +462,10 @@ struct Cell
 	/* Memory space for cell genome (genome is stored as four
 	 * bit instructions packed into machine size words) */
 	uintptr_t genome[POND_DEPTH_SYSWORDS];
+
+	// Position of the cell at screen
+	uintptr_t x;
+	uintptr_t y;
 };
 
 /* The pond is a 2D array of cells */
@@ -508,7 +513,7 @@ struct PerReportStatCounters
 
 /* Global statistics counters */
 struct PerReportStatCounters statCounters;
-
+#ifdef DO_REPORT
 /**
  * Output a line of comma-seperated statistics data
  *
@@ -542,7 +547,7 @@ static void doReport(const uint64_t clock)
 	/* Look here to get the columns in the CSV output */
 
 	/* The first five are here and are self-explanatory */
-	printf("%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",
+	printf("%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
 			(uint64_t)clock,
 			(uint64_t)totalEnergy,
 			(uint64_t)totalActiveCells,
@@ -589,7 +594,7 @@ static void doDump(const uint64_t clock)
 	uintptr_t x,y,wordPtr,shiftPtr,inst,stopCount,i;
 	struct Cell *pptr;
 
-	sprintf(buf,"%llu.dump.csv",clock);
+	sprintf(buf,"%lu.dump.csv",clock);
 	d = fopen(buf,"w");
 	if (!d) {
 		fprintf(stderr,"[WARNING] Could not open %s for writing.\n",buf);
@@ -602,7 +607,7 @@ static void doDump(const uint64_t clock)
 		for(y=0;y<POND_SIZE_Y;++y) {
 			pptr = &pond[x][y];
 			if (pptr->energy&&(pptr->generation > 2)) {
-				fprintf(d,"%llu,%llu,%llu,%llu,",
+				fprintf(d,"%lu,%lu,%lu,%lu,",
 						(uint64_t)pptr->ID,
 						(uint64_t)pptr->parentID,
 						(uint64_t)pptr->lineage,
@@ -618,7 +623,7 @@ static void doDump(const uint64_t clock)
 					 * a LOOP/REP pair that's always false. In any case, this
 					 * would always result in our *underestimating* the size of
 					 * the genome and would never result in an overestimation. */
-					fprintf(d,"%x",inst);
+					fprintf(d,"%lu",inst);
 					if (inst == 0xf) { /* STOP */
 						if (++stopCount >= 4)
 							break;
@@ -660,7 +665,7 @@ static void dumpCell(FILE *file, struct Cell *cell)
 			 * a LOOP/REP pair that's always false. In any case, this
 			 * would always result in our *underestimating* the size of
 			 * the genome and would never result in an overestimation. */
-			fprintf(file,"%x",inst);
+			fprintf(file,"%lu",inst);
 			if (inst == 0xf) { /* STOP */
 				if (++stopCount >= 4)
 					break;
@@ -675,7 +680,7 @@ static void dumpCell(FILE *file, struct Cell *cell)
 	}
 	fprintf(file,"\n");
 }
-
+#endif
 /**
  * Get a neighbor in the pond
  *
@@ -778,6 +783,133 @@ static inline uint8_t getColor(struct Cell *c)
 	return 0; /* Cells with no energy are black */
 }
 
+#ifdef USE_SDL
+threadpool uiThread;
+#endif
+threadpool entropyThread;
+threadpool executionThread;
+int stopExecution = 0;
+
+void stopThreads(){
+#ifdef USE_SDL
+	thpool_destroy(uiThread);
+#endif
+	thpool_destroy(entropyThread);
+	thpool_destroy(executionThread);
+	exit(0);
+}
+
+#ifdef USE_SDL
+SDL_Surface *screen;
+SDL_Event sdlEvent;
+uintptr_t sdlPitch;
+
+void updateUI(void *ex){
+	while (SDL_PollEvent(&sdlEvent)) {
+		if (sdlEvent.type == SDL_QUIT) {
+			fprintf(stderr,"[QUIT] Quit signal received!\n");
+			int *exit = (int *)ex;
+			*exit = 1;
+		} else if (sdlEvent.type == SDL_MOUSEBUTTONDOWN) {
+			switch (sdlEvent.button.button) {
+				case SDL_BUTTON_LEFT:
+					fprintf(stderr,"[INTERFACE] Genome of cell at (%d, %d):\n",sdlEvent.button.x, sdlEvent.button.y);
+					//dumpCell(stderr, &pond[sdlEvent.button.x][sdlEvent.button.y]);
+					break;
+				case SDL_BUTTON_RIGHT:
+					if(SDL_MUSTLOCK(screen))
+						SDL_LockSurface(screen);
+					colorScheme = (colorScheme + 1) % MAX_COLOR_SCHEME;
+					fprintf(stderr,"[INTERFACE] Switching to color scheme \"%s\".\n",colorSchemeName[colorScheme]);
+					int x, y;
+					for (y=0;y<POND_SIZE_Y;++y) {
+						for (x=0;x<POND_SIZE_X;++x)
+							((uint8_t *)screen->pixels)[x + (y * sdlPitch)] = getColor(&pond[x][y]);
+					}
+					if(SDL_MUSTLOCK(screen))
+						SDL_UnlockSurface(screen);
+					break;
+			}
+		}
+	}
+	SDL_UpdateRect(screen,0,0,POND_SIZE_X,POND_SIZE_Y);
+}
+
+typedef struct {
+	uintptr_t x;
+	uintptr_t y;
+	struct Cell *pptr;
+	int colored;
+} Point;
+
+void colorPoint(void *p){
+	struct Cell *pptr = (struct Cell *)p;
+	uintptr_t x = pptr->x;
+	uintptr_t y = pptr->y;
+	if (SDL_MUSTLOCK(screen))
+		SDL_LockSurface(screen);
+	((uint8_t *)screen->pixels)[x + (y * sdlPitch)] = getColor(pptr);
+	if (SDL_MUSTLOCK(screen))
+		SDL_UnlockSurface(screen);
+}
+
+void updateNeighbourhood(void *p){
+	struct Cell *pptr = (struct Cell *)p;
+	uintptr_t x = pptr->x;
+	uintptr_t y = pptr->y;
+
+	if (SDL_MUSTLOCK(screen))
+		SDL_LockSurface(screen);
+	((uint8_t *)screen->pixels)[x + (y * sdlPitch)] = getColor(pptr);
+	if (x) {
+		((uint8_t *)screen->pixels)[(x-1) + (y * sdlPitch)] = getColor(&pond[x-1][y]);
+		if (x < (POND_SIZE_X-1))
+			((uint8_t *)screen->pixels)[(x+1) + (y * sdlPitch)] = getColor(&pond[x+1][y]);
+		else ((uint8_t *)screen->pixels)[y * sdlPitch] = getColor(&pond[0][y]);
+	} else {
+		((uint8_t *)screen->pixels)[(POND_SIZE_X-1) + (y * sdlPitch)] = getColor(&pond[POND_SIZE_X-1][y]);
+		((uint8_t *)screen->pixels)[1 + (y * sdlPitch)] = getColor(&pond[1][y]);
+	}
+	if (y) {
+		((uint8_t *)screen->pixels)[x + ((y-1) * sdlPitch)] = getColor(&pond[x][y-1]);
+		if (y < (POND_SIZE_Y-1))
+			((uint8_t *)screen->pixels)[x + ((y+1) * sdlPitch)] = getColor(&pond[x][y+1]);
+		else ((uint8_t *)screen->pixels)[x] = getColor(&pond[x][0]);
+	} else {
+		((uint8_t *)screen->pixels)[x + ((POND_SIZE_Y-1) * sdlPitch)] = getColor(&pond[x][POND_SIZE_Y-1]);
+		((uint8_t *)screen->pixels)[x + sdlPitch] = getColor(&pond[x][1]);
+	}
+	if (SDL_MUSTLOCK(screen))
+		SDL_UnlockSurface(screen);
+}
+
+#endif /* Use SDL */
+
+void introduceEntropy(void *cellIdCounter){
+	uintptr_t x = getRandom() % POND_SIZE_X;
+	uintptr_t y = getRandom() % POND_SIZE_Y;
+	struct Cell * pptr = &pond[x][y];
+	pptr->ID = (*(int *)cellIdCounter)++;
+	pptr->parentID = 0;
+	pptr->lineage = pptr->ID;
+	pptr->generation = 0;
+	pptr->x = x;
+	pptr->y = y;
+#ifdef INFLOW_RATE_VARIATION
+	pptr->energy += INFLOW_RATE_BASE + (getRandom() % INFLOW_RATE_VARIATION);
+#else
+	pptr->energy += INFLOW_RATE_BASE;
+#endif /* INFLOW_RATE_VARIATION */
+	int i;
+	for(i=0;i<POND_DEPTH_SYSWORDS;++i) 
+		pptr->genome[i] = getRandom();
+	++cellIdCounter;
+
+	/* Update the random cell on SDL screen if viz is enabled */
+#ifdef USE_SDL
+	thpool_add_work(uiThread, &colorPoint, &pond[x][y]);
+#endif /* USE_SDL */
+}
 /**
  * Main method
  *
@@ -787,6 +919,10 @@ static inline uint8_t getColor(struct Cell *c)
 int main(int argc,char **argv)
 {
 	uintptr_t i,x,y;
+
+	uiThread = thpool_init(1);
+	entropyThread = thpool_init(1);
+	executionThread = thpool_init(1);
 
 	/* Buffer used for execution output of candidate offspring */
 	uintptr_t outputBuf[POND_DEPTH_SYSWORDS];
@@ -802,8 +938,6 @@ int main(int argc,char **argv)
 
 	/* Set up SDL if we're using it */
 #ifdef USE_SDL
-	SDL_Surface *screen;
-	SDL_Event sdlEvent;
 	if (SDL_Init(SDL_INIT_VIDEO) < 0 ) {
 		fprintf(stderr,"*** Unable to init SDL: %s ***\n",SDL_GetError());
 		exit(1);
@@ -815,7 +949,7 @@ int main(int argc,char **argv)
 		fprintf(stderr, "*** Unable to create SDL window: %s ***\n", SDL_GetError());
 		exit(1);
 	}
-	const uintptr_t sdlPitch = screen->pitch;
+	sdlPitch = screen->pitch;
 #endif /* USE_SDL */
 
 	/* Clear the pond and initialize all genomes
@@ -836,7 +970,7 @@ int main(int argc,char **argv)
 	uint64_t clock = 0;
 
 	/* This is used to generate unique cell IDs */
-	uint64_t cellIdCounter = 0;
+	_Atomic uint64_t cellIdCounter = 0;
 
 	/* Miscellaneous variables used in the loop */
 	uintptr_t currentWord,wordPtr,shiftPtr,inst,tmp;
@@ -866,9 +1000,10 @@ int main(int argc,char **argv)
 	/* If this is nonzero, cell execution stops. This allows us
 	 * to avoid the ugly use of a goto to exit the loop. :) */
 	int stop;
+	int exit = 0;
 
 	/* Main loop */
-	for(;;) {
+	while(!stopExecution) {
 		/* Stop at STOP_AT if defined */
 #ifdef STOP_AT
 		if (clock >= STOP_AT) {
@@ -887,35 +1022,16 @@ int main(int argc,char **argv)
 			//doReport(clock);
 			/* SDL display is also refreshed every REPORT_FREQUENCY */
 #ifdef USE_SDL
-			while (SDL_PollEvent(&sdlEvent)) {
-				if (sdlEvent.type == SDL_QUIT) {
-					fprintf(stderr,"[QUIT] Quit signal received!\n");
-					exit(0);
-				} else if (sdlEvent.type == SDL_MOUSEBUTTONDOWN) {
-					switch (sdlEvent.button.button) {
-						case SDL_BUTTON_LEFT:
-							fprintf(stderr,"[INTERFACE] Genome of cell at (%d, %d):\n",sdlEvent.button.x, sdlEvent.button.y);
-							dumpCell(stderr, &pond[sdlEvent.button.x][sdlEvent.button.y]);
-							break;
-						case SDL_BUTTON_RIGHT:
-							colorScheme = (colorScheme + 1) % MAX_COLOR_SCHEME;
-							fprintf(stderr,"[INTERFACE] Switching to color scheme \"%s\".\n",colorSchemeName[colorScheme]);
-							for (y=0;y<POND_SIZE_Y;++y) {
-								for (x=0;x<POND_SIZE_X;++x)
-									((uint8_t *)screen->pixels)[x + (y * sdlPitch)] = getColor(&pond[x][y]);
-							}
-							break;
-					}
-				}
-			}
-			SDL_UpdateRect(screen,0,0,POND_SIZE_X,POND_SIZE_Y);
+			thpool_add_work(uiThread, &updateUI, &stopExecution);
 #endif /* USE_SDL */
 		}
 
 		/* Periodically dump the viable population if defined */
 #ifdef DUMP_FREQUENCY
+#ifdef DO_REPORT
 		if (!(clock % DUMP_FREQUENCY))
 			doDump(clock);
+#endif
 #endif /* DUMP_FREQUENCY */
 
 		/* Introduce a random cell somewhere with a given energy level */
@@ -923,30 +1039,7 @@ int main(int argc,char **argv)
 		 * entropy into the substrate. This happens every INFLOW_FREQUENCY
 		 * clock ticks. */
 		if (!(clock % INFLOW_FREQUENCY)) {
-			x = getRandom() % POND_SIZE_X;
-			y = getRandom() % POND_SIZE_Y;
-			pptr = &pond[x][y];
-			pptr->ID = cellIdCounter;
-			pptr->parentID = 0;
-			pptr->lineage = cellIdCounter;
-			pptr->generation = 0;
-#ifdef INFLOW_RATE_VARIATION
-			pptr->energy += INFLOW_RATE_BASE + (getRandom() % INFLOW_RATE_VARIATION);
-#else
-			pptr->energy += INFLOW_RATE_BASE;
-#endif /* INFLOW_RATE_VARIATION */
-			for(i=0;i<POND_DEPTH_SYSWORDS;++i) 
-				pptr->genome[i] = getRandom();
-			++cellIdCounter;
-
-			/* Update the random cell on SDL screen if viz is enabled */
-#ifdef USE_SDL
-			if (SDL_MUSTLOCK(screen))
-				SDL_LockSurface(screen);
-			((uint8_t *)screen->pixels)[x + (y * sdlPitch)] = getColor(pptr);
-			if (SDL_MUSTLOCK(screen))
-				SDL_UnlockSurface(screen);
-#endif /* USE_SDL */
+			thpool_add_work(entropyThread, &introduceEntropy, &cellIdCounter);
 		}
 
 		/* Pick a random cell to execute */
@@ -1168,32 +1261,10 @@ int main(int argc,char **argv)
 
 		/* Update the neighborhood on SDL screen to show any changes. */
 #ifdef USE_SDL
-		if (SDL_MUSTLOCK(screen))
-			SDL_LockSurface(screen);
-		((uint8_t *)screen->pixels)[x + (y * sdlPitch)] = getColor(pptr);
-		if (x) {
-			((uint8_t *)screen->pixels)[(x-1) + (y * sdlPitch)] = getColor(&pond[x-1][y]);
-			if (x < (POND_SIZE_X-1))
-				((uint8_t *)screen->pixels)[(x+1) + (y * sdlPitch)] = getColor(&pond[x+1][y]);
-			else ((uint8_t *)screen->pixels)[y * sdlPitch] = getColor(&pond[0][y]);
-		} else {
-			((uint8_t *)screen->pixels)[(POND_SIZE_X-1) + (y * sdlPitch)] = getColor(&pond[POND_SIZE_X-1][y]);
-			((uint8_t *)screen->pixels)[1 + (y * sdlPitch)] = getColor(&pond[1][y]);
-		}
-		if (y) {
-			((uint8_t *)screen->pixels)[x + ((y-1) * sdlPitch)] = getColor(&pond[x][y-1]);
-			if (y < (POND_SIZE_Y-1))
-				((uint8_t *)screen->pixels)[x + ((y+1) * sdlPitch)] = getColor(&pond[x][y+1]);
-			else ((uint8_t *)screen->pixels)[x] = getColor(&pond[x][0]);
-		} else {
-			((uint8_t *)screen->pixels)[x + ((POND_SIZE_Y-1) * sdlPitch)] = getColor(&pond[x][POND_SIZE_Y-1]);
-			((uint8_t *)screen->pixels)[x + sdlPitch] = getColor(&pond[x][1]);
-		}
-		if (SDL_MUSTLOCK(screen))
-			SDL_UnlockSurface(screen);
+		thpool_add_work(uiThread, &updateNeighbourhood, pptr);
 #endif /* USE_SDL */
 	}
 
-	exit(0);
+	stopThreads();
 	return 0; /* Make compiler shut up */
 }
