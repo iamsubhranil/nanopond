@@ -285,6 +285,11 @@
 	/* Comment this out to compile without SDL visualization support. */
 #define USE_SDL 1
 
+#define DO_REPORT
+
+#define UI_THREADS 2
+#define ENTROPY_THREADS 2
+#define EXECUTION_THREADS 1
 	/* ----------------------------------------------------------------------- */
 
 #include <stdint.h>
@@ -434,7 +439,6 @@ static inline uint32_t genrand_int32()
 /* This is after the "logo" */
 #define EXEC_START_WORD 0
 #define EXEC_START_BIT 4
-
 /* Number of bits set in binary numbers 0000 through 1111 */
 static const uintptr_t BITS_IN_FOURBIT_WORD[16] = { 0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4 };
 
@@ -901,7 +905,7 @@ void introduceEntropy(void *dummy){
 #else
 	pptr->energy += INFLOW_RATE_BASE;
 #endif /* INFLOW_RATE_VARIATION */
-	int i;
+	uintptr_t i;
 	for(i=0;i<POND_DEPTH_SYSWORDS;++i) 
 		pptr->genome[i] = getRandom();
 	++cellIdCounter;
@@ -1151,9 +1155,9 @@ int main(int argc,char **argv)
 {
 	uintptr_t i,x,y;
 
-	uiThread = thpool_init(1);
-	entropyThread = thpool_init(1);
-	executionThread = thpool_init(1);
+	uiThread = thpool_init(UI_THREADS);
+	entropyThread = thpool_init(ENTROPY_THREADS);
+	executionThread = thpool_init(EXECUTION_THREADS);
 
 	/* Seed and init the random number generator */
 	init_genrand(time(NULL));
@@ -1199,9 +1203,6 @@ int main(int argc,char **argv)
 	/* Clock is incremented on each core loop */
 	uint64_t clock = 0;
 
-	/* This is used to generate unique cell IDs */
-	int exit = 0;
-
 	/* Main loop */
 	while(!stopExecution) {
 		/* Stop at STOP_AT if defined */
@@ -1209,7 +1210,9 @@ int main(int argc,char **argv)
 		if (clock >= STOP_AT) {
 			/* Also do a final dump if dumps are enabled */
 #ifdef DUMP_FREQUENCY
+#ifdef DO_REPORT
 			doDump(clock);
+#endif
 #endif /* DUMP_FREQUENCY */
 			fprintf(stderr,"[QUIT] STOP_AT clock value reached\n");
 			break;
@@ -1228,10 +1231,10 @@ int main(int argc,char **argv)
 
 		/* Periodically dump the viable population if defined */
 #ifdef DUMP_FREQUENCY
-#ifdef DO_REPORT
+
 		if (!(clock % DUMP_FREQUENCY))
 			doDump(clock);
-#endif
+
 #endif /* DUMP_FREQUENCY */
 
 		/* Introduce a random cell somewhere with a given energy level */
