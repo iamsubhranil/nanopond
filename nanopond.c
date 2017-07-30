@@ -239,7 +239,7 @@
 	 * info while slowing down the simulation. Higher values will give less
 	 * frequent updates. */
 	/* This is also the frequency of screen refreshes if SDL is enabled. */
-#define REPORT_FREQUENCY 100000
+#define REPORT_FREQUENCY 1000000
 
 	/* Frequency at which to dump all viable replicators (generation > 2)
 	 * to a file named <clock>.dump in the current directory.  Comment
@@ -287,9 +287,9 @@
 
 #define DO_REPORT
 
-#define UI_THREADS 2
+#define UI_THREADS 1
 #define ENTROPY_THREADS 2
-#define EXECUTION_THREADS 1
+#define EXECUTION_THREADS 3
 	/* ----------------------------------------------------------------------- */
 
 #include <stdint.h>
@@ -304,8 +304,8 @@
 #include <SDL/SDL.h>
 #endif /* _MSC_VER */
 #endif /* USE_SDL */
-#include"thpool.h"	// Multithreading support
-
+#include"mythreads.h"	// Multithreading support
+#include<unistd.h>
 	/* ----------------------------------------------------------------------- */
 	/* This is the Mersenne Twister by Makoto Matsumoto and Takuji Nishimura   */
 	/* http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/MT2002/emt19937ar.html  */
@@ -788,19 +788,19 @@ static inline uint8_t getColor(struct Cell *c)
 }
 
 #ifdef USE_SDL
-threadpool uiThread;
+ThreadPool * uiThread;
 #endif
-threadpool entropyThread;
-threadpool executionThread;
+ThreadPool * entropyThread;
+ThreadPool * executionThread;
 int stopExecution = 0;
 _Atomic uint64_t cellIdCounter = 0;
 
 void stopThreads(){
 #ifdef USE_SDL
-	thpool_destroy(uiThread);
+	destroyPool(uiThread);
 #endif
-	thpool_destroy(entropyThread);
-	thpool_destroy(executionThread);
+	destroyPool(entropyThread);
+	destroyPool(executionThread);
 	exit(0);
 }
 
@@ -890,6 +890,8 @@ void updateNeighbourhood(void *p){
 
 #endif /* Use SDL */
 
+_Atomic int runningEntropyThreads = 0;
+#define ENTROPY_LIMIT 1000000
 void introduceEntropy(void *dummy){
 	uintptr_t x = getRandom() % POND_SIZE_X;
 	uintptr_t y = getRandom() % POND_SIZE_Y;
@@ -912,9 +914,13 @@ void introduceEntropy(void *dummy){
 
 	/* Update the random cell on SDL screen if viz is enabled */
 #ifdef USE_SDL
-	thpool_add_work(uiThread, &colorPoint, &pond[x][y]);
+	addJobToPool(uiThread, &colorPoint, &pond[x][y]);
 #endif /* USE_SDL */
+	runningEntropyThreads--;
 }
+
+_Atomic int runningVMInstances = 0;
+#define VM_LIMIT 1000000
 
 void executeVM(){
 	/* Pick a random cell to execute */
@@ -1139,11 +1145,11 @@ void executeVM(){
 				tmpptr->genome[i] = outputBuf[i];
 		}
 	}
-
 	/* Update the neighborhood on SDL screen to show any changes. */
 #ifdef USE_SDL
-	thpool_add_work(uiThread, &updateNeighbourhood, &pond[x][y]);
+	addJobToPool(uiThread, &updateNeighbourhood, &pond[x][y]);
 #endif /* USE_SDL */
+	runningVMInstances--;
 }
 /**
  * Main method
@@ -1155,9 +1161,9 @@ int main(int argc,char **argv)
 {
 	uintptr_t i,x,y;
 
-	uiThread = thpool_init(UI_THREADS);
-	entropyThread = thpool_init(ENTROPY_THREADS);
-	executionThread = thpool_init(EXECUTION_THREADS);
+	uiThread = createPool(UI_THREADS);
+	entropyThread = createPool(ENTROPY_THREADS);
+	executionThread = createPool(EXECUTION_THREADS);
 
 	/* Seed and init the random number generator */
 	init_genrand(time(NULL));
@@ -1225,15 +1231,20 @@ int main(int argc,char **argv)
 			//doReport(clock);
 			/* SDL display is also refreshed every REPORT_FREQUENCY */
 #ifdef USE_SDL
-			thpool_add_work(uiThread, &updateUI, &stopExecution);
+			addJobToPool(uiThread, &updateUI, &stopExecution);
 #endif /* USE_SDL */
 		}
 
 		/* Periodically dump the viable population if defined */
 #ifdef DUMP_FREQUENCY
 
-		if (!(clock % DUMP_FREQUENCY))
-			doDump(clock);
+		/*if (!(clock % DUMP_FREQUENCY)){
+			printf("\n[INFO] Clocks count : %lu", clock);
+			printf("\n[INFO][UIThread] Placed : %20lu Complete : %20lu", thpool_num_jobs_placed(uiThread), thpool_num_jobs_done(uiThread));
+			printf("\n[INFO][ExThread] Placed : %20lu Complete : %20lu", thpool_num_jobs_placed(executionThread), thpool_num_jobs_done(executionThread));
+			printf("\n[INFO][EnThread] Placed : %20lu Complete : %20lu\n", thpool_num_jobs_placed(entropyThread), thpool_num_jobs_done(entropyThread));
+		}*/
+			//doDump(clock);
 
 #endif /* DUMP_FREQUENCY */
 
@@ -1241,11 +1252,16 @@ int main(int argc,char **argv)
 		/* This is called seeding, and introduces both energy and
 		 * entropy into the substrate. This happens every INFLOW_FREQUENCY
 		 * clock ticks. */
-		if (!(clock % INFLOW_FREQUENCY)) {
-			thpool_add_work(entropyThread, &introduceEntropy, NULL);
+		if (!(clock % INFLOW_FREQUENCY) && runningEntropyThreads<ENTROPY_LIMIT) {
+			addJobToPool(entropyThread, &introduceEntropy, NULL);
+			runningEntropyThreads++;
 		}
 		//if(thpool_num_jobs_placed(executionThread)-thpool_num_jobs_done(executionThread)<2)
-			//thpool_add_work(executionThread, &executeVM, NULL);
+	//	if(runningVMInstances<VM_LIMIT){
+	//		thpool_add_work(executionThread, &executeVM, NULL);
+	//		runningVMInstances++;
+	//	}
+
 		executeVM();
 	}
 
